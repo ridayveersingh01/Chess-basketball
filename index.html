@@ -61,6 +61,11 @@
     background: #000;
     image-rendering: pixelated;
     image-rendering: crisp-edges;
+    outline: none;
+  }
+
+  canvas:focus-visible {
+    box-shadow: 0 0 0 4px var(--accent);
   }
 
   .controls {
@@ -90,6 +95,18 @@
     text-align: center;
   }
 
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
   @media (max-width: 640px) {
     .controls { grid-template-columns: 1fr; }
   }
@@ -99,12 +116,13 @@
   <main class="wrap">
     <h1>Checkmate Hoops: Royal Oak Rumble</h1>
     <section class="game-shell">
-      <canvas id="game" width="160" height="120" aria-label="Checkmate Hoops game canvas"></canvas>
+      <canvas id="game" width="160" height="120" tabindex="0" aria-label="Checkmate Hoops game canvas"></canvas>
     </section>
     <section class="controls">
       <div class="card"><strong>Move:</strong> <kbd>Arrow Keys</kbd> choose a legal square, then <kbd>Enter</kbd> or <kbd>Space</kbd>.</div>
       <div class="card"><strong>Shoot:</strong> aim with <kbd>Up</kbd>/<kbd>Down</kbd>, hold <kbd>Space</kbd> to charge, release to shoot. <kbd>R</kbd> restarts.</div>
     </section>
+    <p id="status" class="sr-only" aria-live="polite"></p>
   </main>
 
 <script>
@@ -113,6 +131,7 @@
 
   const canvas = document.getElementById("game");
   const ctx = canvas.getContext("2d");
+  const statusEl = document.getElementById("status");
   ctx.imageSmoothingEnabled = false;
 
   const W = 160;
@@ -123,6 +142,26 @@
   const OX = 24;
   const OY = 28;
   const GRAVITY = 118;
+
+  const COLORS = {
+    sky: "#0b2230",
+    sky2: "#17384a",
+    oak: "#5b321e",
+    oakDark: "#2a160f",
+    leaf: "#214e35",
+    leaf2: "#35704b",
+    courtA: "#c98242",
+    courtB: "#d99955",
+    line: "#f7f4dc",
+    player: "#f7f4dc",
+    playerDark: "#9eb3ba",
+    enemy: "#d95542",
+    enemyDark: "#7f271f",
+    accent: "#ffb23f",
+    good: "#65d17a",
+    shadow: "#07151d",
+    blue: "#5cb7d7"
+  };
 
   const Piece = {
     PAWN: "Pawn",
@@ -143,3 +182,771 @@
   ];
 
   const keys = Object.create(null);
+  let lastTime = performance.now();
+  let audioCtx = null;
+
+  let levelIndex = 0;
+  let level = levels[0];
+  let phase = "move";
+  let score = 0;
+  let timeLeft = level.time;
+  let shots = 0;
+  let makes = 0;
+  let message = "Pick a legal square";
+  let messageTimer = 0;
+  let transitionTimer = 0;
+
+  let player = { col: 1, row: 4, piece: level.piece };
+  let defenders = [];
+  let cursor = { col: player.col, row: player.row };
+  let legalMoves = [];
+  let aimAngle = 48;
+  let charge = 0;
+  let charging = false;
+  let ignoreSpaceRelease = false;
+  let ball = null;
+  let hoopY = 43;
+  let hoopDirection = 1;
+  let possession = 0;
+  let shake = 0;
+  let flash = 0;
+  let announcedSecond = -1;
+
+  function announce(text) {
+    statusEl.textContent = text;
+  }
+
+  function beep(frequency, duration = 0.08, type = "square", volume = 0.035) {
+    try {
+      audioCtx ||= new (window.AudioContext || window.webkitAudioContext)();
+      const oscillator = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      oscillator.type = type;
+      oscillator.frequency.value = frequency;
+      gain.gain.value = volume;
+      oscillator.connect(gain);
+      gain.connect(audioCtx.destination);
+      oscillator.start();
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
+      oscillator.stop(audioCtx.currentTime + duration);
+    } catch (_) {
+      // Audio is optional; gameplay continues silently when unavailable.
+    }
+  }
+
+  function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function cellCenter(col, row) {
+    return {
+      x: OX + col * TILE + TILE / 2,
+      y: OY + row * TILE + TILE / 2
+    };
+  }
+
+  function sameCell(a, b) {
+    return a.col === b.col && a.row === b.row;
+  }
+
+  function inBounds(col, row) {
+    return col >= 0 && col < COLS && row >= 0 && row < ROWS;
+  }
+
+  function occupiedByDefender(col, row, exceptIndex = -1) {
+    return defenders.some((d, index) => index !== exceptIndex && d.col === col && d.row === row);
+  }
+
+  function occupied(col, row, movingSide = "player", exceptIndex = -1) {
+    if (movingSide === "player") return occupiedByDefender(col, row);
+    if (player.col === col && player.row === row) return true;
+    return occupiedByDefender(col, row, exceptIndex);
+  }
+
+  function movementVectors(piece) {
+    switch (piece) {
+      case Piece.ROOK:
+        return { sliding: true, vectors: [[1,0],[-1,0],[0,1],[0,-1]] };
+      case Piece.BISHOP:
+        return { sliding: true, vectors: [[1,1],[1,-1],[-1,1],[-1,-1]] };
+      case Piece.QUEEN:
+        return { sliding: true, vectors: [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]] };
+      case Piece.KNIGHT:
+        return { sliding: false, vectors: [[1,2],[2,1],[-1,2],[-2,1],[1,-2],[2,-1],[-1,-2],[-2,-1]] };
+      case Piece.KING:
+        return { sliding: false, vectors: [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]] };
+      case Piece.PAWN:
+      default:
+        return { sliding: false, vectors: [[0,1],[1,1],[-1,1]] };
+    }
+  }
+
+  function getMoves(unit, side = "player", unitIndex = -1) {
+    const { sliding, vectors } = movementVectors(unit.piece);
+    const moves = [];
+
+    for (const [dx, dy] of vectors) {
+      if (sliding) {
+        let col = unit.col + dx;
+        let row = unit.row + dy;
+        while (inBounds(col, row)) {
+          if (occupied(col, row, side, unitIndex)) break;
+          moves.push({ col, row });
+          col += dx;
+          row += dy;
+        }
+      } else {
+        const col = unit.col + dx;
+        const row = unit.row + (side === "enemy" && unit.piece === Piece.PAWN ? -dy : dy);
+        if (inBounds(col, row) && !occupied(col, row, side, unitIndex)) {
+          moves.push({ col, row });
+        }
+      }
+    }
+
+    return moves;
+  }
+
+  function isLegalCursor() {
+    return legalMoves.some(move => sameCell(move, cursor));
+  }
+
+  function spawnDefenders(types) {
+    const spots = [
+      { col: 4, row: 1 },
+      { col: 5, row: 4 },
+      { col: 6, row: 2 },
+      { col: 4, row: 5 }
+    ];
+
+    return types.map((piece, index) => ({
+      piece,
+      col: spots[index].col,
+      row: spots[index].row,
+      bob: index * 1.7
+    }));
+  }
+
+  function setLevel(index) {
+    levelIndex = clamp(index, 0, levels.length - 1);
+    level = levels[levelIndex];
+    score = 0;
+    shots = 0;
+    makes = 0;
+    timeLeft = level.time;
+    possession = 0;
+    announcedSecond = -1;
+    player = { col: 1, row: 4, piece: level.piece };
+    defenders = spawnDefenders(level.defenders);
+    cursor = { col: player.col, row: player.row };
+    aimAngle = 48;
+    charge = 0;
+    charging = false;
+    ball = null;
+    hoopY = level.movingHoop ? 45 : 43;
+    hoopDirection = 1;
+    phase = "move";
+    legalMoves = getMoves(player);
+    message = "Pick a legal square";
+    messageTimer = 1.6;
+    transitionTimer = 0;
+    shake = 0;
+    flash = 0;
+    announce(`${level.name}. Score ${level.goal} points before time runs out.`);
+  }
+
+  function restartLevel() {
+    setLevel(levelIndex);
+    message = "Level restarted";
+    messageTimer = 1.2;
+    beep(180, 0.06);
+  }
+
+  function setMessage(text, seconds = 1.2) {
+    message = text;
+    messageTimer = seconds;
+  }
+
+  function confirmMove() {
+    if (!isLegalCursor()) {
+      setMessage("That square is not legal", 0.8);
+      beep(120, 0.07, "sawtooth");
+      return;
+    }
+
+    player.col = cursor.col;
+    player.row = cursor.row;
+    phase = "aim";
+    aimAngle = clamp(58 + (5 - player.row) * 1.8, 28, 76);
+    charge = 0;
+    charging = false;
+    setMessage("Aim, charge, release!", 1.2);
+    beep(280, 0.05);
+  }
+
+  function launchBall() {
+    if (phase !== "aim" || ball) return;
+
+    const start = cellCenter(player.col, player.row);
+    const radians = aimAngle * Math.PI / 180;
+    const speed = 50 + charge * 115;
+    ball = {
+      x: start.x + 3,
+      y: start.y - 5,
+      prevX: start.x + 3,
+      prevY: start.y - 5,
+      vx: Math.cos(radians) * speed,
+      vy: -Math.sin(radians) * speed,
+      radius: 2,
+      scored: false,
+      age: 0,
+      bounces: 0
+    };
+    shots += 1;
+    phase = "flight";
+    charging = false;
+    charge = 0;
+    setMessage("Ball away!", 0.55);
+    beep(420, 0.055, "triangle");
+  }
+
+  function shotPoints() {
+    const distance = 7 - player.col;
+    return distance >= 5 ? 3 : 2;
+  }
+
+  function registerMake() {
+    if (!ball || ball.scored) return;
+    ball.scored = true;
+    makes += 1;
+    const points = shotPoints();
+    score += points;
+    flash = 0.18;
+    shake = 0.12;
+    setMessage(points === 3 ? "THREE!" : "BUCKET!", 1.0);
+    announce(`${points} points. Score ${score} of ${level.goal}.`);
+    beep(660, 0.08, "square", 0.045);
+    setTimeout(() => beep(880, 0.1, "square", 0.035), 70);
+  }
+
+  function finishShot(made) {
+    ball = null;
+
+    if (made && score >= level.goal) {
+      phase = "levelWon";
+      transitionTimer = 0.7;
+      setMessage("Level clear!", 3);
+      announce(`${level.name} cleared.`);
+      return;
+    }
+
+    if (!made) {
+      setMessage("Miss — defenders rotate", 1.0);
+      beep(105, 0.12, "sawtooth", 0.03);
+    }
+
+    advanceDefenders();
+    possession += 1;
+    if (level.altPiece) {
+      player.piece = possession % 2 === 0 ? level.piece : level.altPiece;
+    }
+    phase = "move";
+    cursor = { col: player.col, row: player.row };
+    legalMoves = getMoves(player);
+  }
+
+  function advanceDefenders() {
+    defenders.forEach((defender, index) => {
+      const moves = getMoves(defender, "enemy", index);
+      if (!moves.length) return;
+
+      moves.sort((a, b) => {
+        const da = Math.abs(a.col - player.col) + Math.abs(a.row - player.row);
+        const db = Math.abs(b.col - player.col) + Math.abs(b.row - player.row);
+        if (da !== db) return da - db;
+        return Math.random() - 0.5;
+      });
+
+      const bestDistance = Math.abs(moves[0].col - player.col) + Math.abs(moves[0].row - player.row);
+      const candidates = moves.filter(move =>
+        Math.abs(move.col - player.col) + Math.abs(move.row - player.row) <= bestDistance + 1
+      );
+      const choice = candidates[Math.floor(Math.random() * candidates.length)];
+      defender.col = choice.col;
+      defender.row = choice.row;
+    });
+  }
+
+  function ballHitsDefender(b) {
+    for (const defender of defenders) {
+      const p = cellCenter(defender.col, defender.row);
+      const dx = b.x - p.x;
+      const dy = b.y - (p.y - 3);
+      if (dx * dx + dy * dy < 20) {
+        b.vx *= -0.28;
+        b.vy = -Math.abs(b.vy) * 0.35;
+        b.x += b.vx * 0.02;
+        shake = 0.09;
+        setMessage("BLOCKED!", 0.75);
+        beep(92, 0.09, "square");
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function updateBall(dt) {
+    if (!ball) return;
+
+    ball.prevX = ball.x;
+    ball.prevY = ball.y;
+    ball.age += dt;
+    ball.vy += GRAVITY * dt;
+    ball.x += ball.vx * dt;
+    ball.y += ball.vy * dt;
+
+    ballHitsDefender(ball);
+
+    const rimLeft = 143;
+    const rimRight = 152;
+    const crossedRim = ball.prevY < hoopY && ball.y >= hoopY && ball.vy > 0;
+    if (!ball.scored && crossedRim && ball.x >= rimLeft - 2 && ball.x <= rimRight + 1) {
+      registerMake();
+    }
+
+    // Backboard bounce.
+    if (ball.x + ball.radius >= 156 && ball.y > hoopY - 17 && ball.y < hoopY + 8 && ball.vx > 0) {
+      ball.x = 156 - ball.radius;
+      ball.vx *= -0.62;
+      ball.bounces += 1;
+      beep(230, 0.04, "square", 0.025);
+    }
+
+    // Rim nudges make near-misses feel physical without being punishing.
+    for (const rimX of [143, 152]) {
+      const dx = ball.x - rimX;
+      const dy = ball.y - hoopY;
+      if (dx * dx + dy * dy < 8 && ball.vy > 0) {
+        ball.vx += dx < 0 ? -10 : 10;
+        ball.vy *= -0.42;
+        ball.bounces += 1;
+      }
+    }
+
+    // Floor bounce, then end the possession.
+    const floorY = OY + ROWS * TILE - 2;
+    if (ball.y + ball.radius >= floorY && ball.vy > 0) {
+      ball.y = floorY - ball.radius;
+      ball.vy *= -0.34;
+      ball.vx *= 0.76;
+      ball.bounces += 1;
+    }
+
+    const out = ball.x < -8 || ball.x > W + 10 || ball.y > H + 10;
+    const settled = ball.age > 1.1 && ball.bounces > 1 && Math.abs(ball.vy) < 24;
+    const timedOut = ball.age > 3.4;
+
+    if (out || settled || timedOut) {
+      finishShot(ball.scored);
+    }
+  }
+
+  function updateHoop(dt) {
+    if (!level.movingHoop || phase === "levelWon" || phase === "lost" || phase === "complete") return;
+    hoopY += hoopDirection * 10 * dt;
+    if (hoopY > 56) {
+      hoopY = 56;
+      hoopDirection = -1;
+    } else if (hoopY < 36) {
+      hoopY = 36;
+      hoopDirection = 1;
+    }
+  }
+
+  function update(dt) {
+    if (messageTimer > 0) messageTimer -= dt;
+    if (shake > 0) shake -= dt;
+    if (flash > 0) flash -= dt;
+
+    if (["move", "aim", "flight"].includes(phase)) {
+      timeLeft -= dt;
+      const wholeSecond = Math.max(0, Math.ceil(timeLeft));
+      if (wholeSecond !== announcedSecond && wholeSecond <= 10) {
+        announcedSecond = wholeSecond;
+        if (wholeSecond > 0) announce(`${wholeSecond} seconds remaining.`);
+      }
+      if (timeLeft <= 0) {
+        timeLeft = 0;
+        charging = false;
+        ball = null;
+        phase = "lost";
+        setMessage("Time! Press Enter to retry", 99);
+        announce(`Time expired. You scored ${score} of ${level.goal}. Press Enter to retry.`);
+        beep(80, 0.28, "sawtooth", 0.04);
+      }
+    }
+
+    updateHoop(dt);
+
+    if (phase === "aim") {
+      if (keys.ArrowUp) aimAngle = clamp(aimAngle + 47 * dt, 24, 76);
+      if (keys.ArrowDown) aimAngle = clamp(aimAngle - 47 * dt, 24, 76);
+      if (charging) charge = Math.min(1, charge + dt * 0.72);
+    } else if (phase === "flight") {
+      updateBall(dt);
+    } else if (phase === "levelWon") {
+      transitionTimer -= dt;
+    }
+  }
+
+  function moveCursor(dx, dy) {
+    if (phase !== "move") return;
+    cursor.col = clamp(cursor.col + dx, 0, COLS - 1);
+    cursor.row = clamp(cursor.row + dy, 0, ROWS - 1);
+    beep(isLegalCursor() ? 310 : 160, 0.025, "square", 0.018);
+  }
+
+  function nextLevel() {
+    if (levelIndex >= levels.length - 1) {
+      phase = "complete";
+      announce("You won the Royal Oak Rumble. Press Enter to play again.");
+      beep(523, 0.1, "square");
+      setTimeout(() => beep(659, 0.1, "square"), 90);
+      setTimeout(() => beep(784, 0.16, "square"), 180);
+      return;
+    }
+    setLevel(levelIndex + 1);
+  }
+
+  function handleOverlayAction() {
+    if (phase === "lost") {
+      restartLevel();
+    } else if (phase === "levelWon") {
+      nextLevel();
+    } else if (phase === "complete") {
+      setLevel(0);
+    }
+  }
+
+  window.addEventListener("keydown", event => {
+    if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space"].includes(event.code)) {
+      event.preventDefault();
+    }
+
+    keys[event.code] = true;
+
+    if (event.code === "KeyR") {
+      restartLevel();
+      return;
+    }
+
+    if (["lost", "levelWon", "complete"].includes(phase) && (event.code === "Enter" || event.code === "Space")) {
+      handleOverlayAction();
+      return;
+    }
+
+    if (phase === "move") {
+      if (event.repeat && !event.code.startsWith("Arrow")) return;
+      if (event.code === "ArrowLeft") moveCursor(-1, 0);
+      if (event.code === "ArrowRight") moveCursor(1, 0);
+      if (event.code === "ArrowUp") moveCursor(0, -1);
+      if (event.code === "ArrowDown") moveCursor(0, 1);
+      if (event.code === "Enter" || event.code === "Space") {
+        if (event.code === "Space") ignoreSpaceRelease = true;
+        confirmMove();
+      }
+      return;
+    }
+
+    if (phase === "aim" && event.code === "Space" && !event.repeat) {
+      charging = true;
+      charge = Math.max(charge, 0.04);
+    }
+  }, { passive: false });
+
+  window.addEventListener("keyup", event => {
+    keys[event.code] = false;
+
+    if (event.code === "Space") {
+      if (ignoreSpaceRelease) {
+        ignoreSpaceRelease = false;
+        return;
+      }
+      if (phase === "aim" && charging) launchBall();
+    }
+  });
+
+  window.addEventListener("blur", () => {
+    Object.keys(keys).forEach(key => { keys[key] = false; });
+    charging = false;
+  });
+
+  canvas.addEventListener("pointerdown", () => canvas.focus());
+
+  function rect(x, y, w, h, color) {
+    ctx.fillStyle = color;
+    ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
+  }
+
+  function text(value, x, y, color = COLORS.line, align = "left", size = 7) {
+    ctx.font = `bold ${size}px monospace`;
+    ctx.textAlign = align;
+    ctx.textBaseline = "top";
+    ctx.fillStyle = COLORS.shadow;
+    ctx.fillText(value, Math.round(x) + 1, Math.round(y) + 1);
+    ctx.fillStyle = color;
+    ctx.fillText(value, Math.round(x), Math.round(y));
+  }
+
+  function drawBackground(now) {
+    rect(0, 0, W, H, COLORS.sky);
+    rect(0, 16, W, 2, COLORS.sky2);
+
+    // Pixel skyline and Royal Oak tree silhouettes.
+    rect(5, 7, 14, 9, COLORS.sky2);
+    rect(8, 4, 8, 3, COLORS.sky2);
+    rect(26, 10, 12, 6, COLORS.sky2);
+    rect(132, 6, 20, 10, COLORS.sky2);
+    rect(138, 3, 8, 3, COLORS.sky2);
+
+    rect(6, 15, 3, 15, COLORS.oakDark);
+    rect(151, 13, 3, 17, COLORS.oakDark);
+    rect(2, 10, 12, 8, COLORS.leaf);
+    rect(145, 8, 14, 10, COLORS.leaf2);
+    rect(0, 14, 18, 5, COLORS.leaf2);
+    rect(141, 14, 19, 5, COLORS.leaf);
+
+    // Twinkling scoreboard lights.
+    for (let i = 0; i < 8; i += 1) {
+      const glow = Math.sin(now * 0.002 + i) > 0.3;
+      rect(48 + i * 8, 19, 3, 2, glow ? COLORS.accent : COLORS.sky2);
+    }
+  }
+
+  function drawCourt() {
+    for (let row = 0; row < ROWS; row += 1) {
+      for (let col = 0; col < COLS; col += 1) {
+        rect(
+          OX + col * TILE,
+          OY + row * TILE,
+          TILE,
+          TILE,
+          (row + col) % 2 === 0 ? COLORS.courtA : COLORS.courtB
+        );
+      }
+    }
+
+    ctx.strokeStyle = COLORS.line;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(OX + 0.5, OY + 0.5, COLS * TILE - 1, ROWS * TILE - 1);
+
+    ctx.beginPath();
+    ctx.arc(OX + COLS * TILE / 2, OY + ROWS * TILE / 2, 13, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(OX + COLS * TILE - 1, OY + ROWS * TILE / 2, 21, Math.PI / 2, Math.PI * 1.5);
+    ctx.stroke();
+
+    rect(OX + COLS * TILE - 17, OY + 18, 17, 48, "rgba(247,244,220,0.12)");
+  }
+
+  function drawMoveHints() {
+    if (phase !== "move") return;
+
+    for (const move of legalMoves) {
+      const p = cellCenter(move.col, move.row);
+      rect(p.x - 1, p.y - 1, 3, 3, COLORS.good);
+    }
+
+    const x = OX + cursor.col * TILE;
+    const y = OY + cursor.row * TILE;
+    const color = isLegalCursor() ? COLORS.accent : COLORS.enemy;
+    rect(x, y, TILE, 1, color);
+    rect(x, y + TILE - 1, TILE, 1, color);
+    rect(x, y, 1, TILE, color);
+    rect(x + TILE - 1, y, 1, TILE, color);
+  }
+
+  function pieceLetter(piece) {
+    return {
+      [Piece.PAWN]: "P",
+      [Piece.ROOK]: "R",
+      [Piece.BISHOP]: "B",
+      [Piece.KNIGHT]: "N",
+      [Piece.QUEEN]: "Q",
+      [Piece.KING]: "K"
+    }[piece] || "?";
+  }
+
+  function drawPiece(unit, enemy = false, now = 0) {
+    const p = cellCenter(unit.col, unit.row);
+    const bob = enemy ? Math.sin(now * 0.005 + unit.bob) * 0.7 : 0;
+    const x = Math.round(p.x);
+    const y = Math.round(p.y + bob);
+    const main = enemy ? COLORS.enemy : COLORS.player;
+    const dark = enemy ? COLORS.enemyDark : COLORS.playerDark;
+
+    rect(x - 4, y + 3, 9, 2, dark);
+    rect(x - 3, y - 3, 7, 6, main);
+    rect(x - 2, y - 5, 5, 2, main);
+
+    if (unit.piece === Piece.ROOK) {
+      rect(x - 3, y - 6, 2, 2, main);
+      rect(x, y - 6, 1, 2, main);
+      rect(x + 2, y - 6, 2, 2, main);
+    } else if (unit.piece === Piece.BISHOP) {
+      rect(x, y - 7, 1, 3, main);
+      rect(x - 1, y - 6, 3, 1, main);
+    } else if (unit.piece === Piece.KNIGHT) {
+      rect(x - 2, y - 7, 4, 2, main);
+      rect(x + 1, y - 5, 3, 3, main);
+    } else if (unit.piece === Piece.QUEEN) {
+      rect(x - 3, y - 7, 1, 2, main);
+      rect(x, y - 8, 1, 3, main);
+      rect(x + 3, y - 7, 1, 2, main);
+    } else if (unit.piece === Piece.KING) {
+      rect(x, y - 8, 1, 4, main);
+      rect(x - 2, y - 7, 5, 1, main);
+    } else {
+      rect(x - 1, y - 7, 3, 3, main);
+    }
+
+    text(pieceLetter(unit.piece), x, y - 2, enemy ? COLORS.line : COLORS.shadow, "center", 5);
+  }
+
+  function drawHoop() {
+    rect(155, hoopY - 18, 2, 25, COLORS.line);
+    rect(153, hoopY - 17, 4, 11, "#cfe8ef");
+    rect(142, hoopY - 1, 12, 2, COLORS.accent);
+    rect(143, hoopY + 1, 1, 5, COLORS.line);
+    rect(151, hoopY + 1, 1, 5, COLORS.line);
+    rect(145, hoopY + 5, 6, 1, COLORS.line);
+  }
+
+  function predictedTrajectory() {
+    if (phase !== "aim") return;
+
+    const start = cellCenter(player.col, player.row);
+    const previewCharge = charging ? charge : 0.55;
+    const speed = 50 + previewCharge * 115;
+    const radians = aimAngle * Math.PI / 180;
+    const vx = Math.cos(radians) * speed;
+    const vy = -Math.sin(radians) * speed;
+
+    for (let i = 1; i <= 13; i += 1) {
+      const t = i * 0.075;
+      const x = start.x + 3 + vx * t;
+      const y = start.y - 5 + vy * t + 0.5 * GRAVITY * t * t;
+      if (x > W || y > H || y < 18) break;
+      rect(x, y, 1, 1, i % 2 ? COLORS.line : COLORS.accent);
+    }
+  }
+
+  function drawBall() {
+    if (!ball) return;
+    rect(ball.x - 2, ball.y - 2, 4, 4, "#e8752d");
+    rect(ball.x - 1, ball.y - 2, 1, 4, COLORS.oakDark);
+    rect(ball.x - 2, ball.y, 4, 1, COLORS.oakDark);
+  }
+
+  function drawHud() {
+    rect(0, 0, W, 16, "#07151ddd");
+    text(`L${levelIndex + 1}/6`, 4, 3, COLORS.blue, "left", 6);
+    text(`${score}/${level.goal}`, 41, 3, COLORS.accent, "left", 7);
+    text(`${Math.ceil(timeLeft)}s`, 94, 3, timeLeft <= 10 ? COLORS.enemy : COLORS.line, "left", 7);
+    text(player.piece, 156, 3, COLORS.line, "right", 6);
+
+    if (phase === "aim") {
+      rect(3, 105, 52, 11, "#07151ddd");
+      text(`${Math.round(aimAngle)}°`, 6, 107, COLORS.line, "left", 6);
+      rect(25, 108, 27, 5, COLORS.oakDark);
+      rect(26, 109, 25 * charge, 3, charge > 0.86 ? COLORS.enemy : COLORS.accent);
+      const marker = 26 + 25 * recommendedCharge();
+      rect(marker, 107, 1, 7, COLORS.good);
+    }
+
+    if (messageTimer > 0 && message) {
+      const width = Math.min(150, Math.max(62, message.length * 4 + 10));
+      rect((W - width) / 2, 18, width, 9, "#07151ddd");
+      text(message, W / 2, 19, COLORS.line, "center", 6);
+    }
+  }
+
+  function recommendedCharge() {
+    const start = cellCenter(player.col, player.row);
+    const dx = 147 - (start.x + 3);
+    const dyUp = (start.y - 5) - hoopY;
+    const angle = aimAngle * Math.PI / 180;
+    const denominator = 2 * Math.cos(angle) ** 2 * (dx * Math.tan(angle) - dyUp);
+    if (denominator <= 1) return 1;
+    const requiredSpeed = Math.sqrt(GRAVITY * dx * dx / denominator);
+    return clamp((requiredSpeed - 50) / 115, 0, 1);
+  }
+
+  function drawOverlay(title, lines, footer) {
+    rect(14, 31, 132, 58, "#07151df2");
+    rect(16, 33, 128, 1, COLORS.accent);
+    rect(16, 86, 128, 1, COLORS.accent);
+    text(title, W / 2, 39, COLORS.accent, "center", 10);
+    lines.forEach((line, index) => {
+      text(line, W / 2, 55 + index * 9, COLORS.line, "center", 6);
+    });
+    text(footer, W / 2, 77, COLORS.good, "center", 6);
+  }
+
+  function drawEndStates() {
+    if (phase === "lost") {
+      drawOverlay("BUZZER!", [`Score ${score}/${level.goal}`, `${makes}/${shots || 0} shots made`], "ENTER: RETRY");
+    } else if (phase === "levelWon") {
+      const accuracy = shots ? Math.round(makes / shots * 100) : 0;
+      drawOverlay("LEVEL CLEAR", [`Score ${score}  Accuracy ${accuracy}%`, levelIndex < levels.length - 1 ? "Next challenge awaits" : "The crown is yours"], "ENTER: CONTINUE");
+    } else if (phase === "complete") {
+      drawOverlay("CHECKMATE!", ["ROYAL OAK CHAMPION", "All six courts cleared"], "ENTER: PLAY AGAIN");
+    }
+  }
+
+  function render(now) {
+    ctx.save();
+    ctx.clearRect(0, 0, W, H);
+
+    if (shake > 0) {
+      ctx.translate(Math.random() < 0.5 ? -1 : 1, Math.random() < 0.5 ? -1 : 1);
+    }
+
+    drawBackground(now);
+    drawCourt();
+    drawMoveHints();
+    predictedTrajectory();
+
+    defenders.forEach(defender => drawPiece(defender, true, now));
+    drawPiece(player, false, now);
+    drawHoop();
+    drawBall();
+    drawHud();
+    drawEndStates();
+
+    if (flash > 0) {
+      ctx.globalAlpha = Math.min(0.45, flash * 2.4);
+      rect(0, 0, W, H, COLORS.line);
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.restore();
+  }
+
+  function frame(now) {
+    const dt = Math.min(0.033, (now - lastTime) / 1000);
+    lastTime = now;
+    update(dt);
+    render(now);
+    requestAnimationFrame(frame);
+  }
+
+  setLevel(0);
+  canvas.focus();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
